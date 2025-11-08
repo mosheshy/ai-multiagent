@@ -1,0 +1,39 @@
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Node modules and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files (ignore real secrets; keep example files)
+.env*
+!.env.example
+
+# Server/client specifics (redundant if node_modules/ above, kept for clarity)
+server/node_modules/
+client/node_modules/
+
+# Next.js build
+client/.next/
+client/.turbo/
+.next/
+
+# Build / output
+dist/
+build/
+
+# Lockfiles — usually you SHOULD commit these to lock dependencies.
+# If you want to ignore them, keep the lines below; otherwise remove them.
+server/package-lock.json
+client/package-lock.json
+
+# Misc
+server/.env
+client/.env
+server/logs/
+coverage/
