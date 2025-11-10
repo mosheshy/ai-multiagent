@@ -9,13 +9,17 @@
     "dev": "node app/server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock": "^3.927.0",
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.927.0",
     "@aws-sdk/client-bedrock-runtime": "^3.926.0",
     "@aws-sdk/client-sts": "^3.926.0",
     "@aws-sdk/credential-provider-node": "^3.926.0",
     "client-bedrock-runtime": "github:aws-sdk/client-bedrock-runtime",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
-    "dotenv": "^16.0.0",
-    "express": "^4.18.2",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.0"
   }
 }

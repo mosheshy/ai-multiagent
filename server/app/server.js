@@ -1,68 +1,154 @@
 // --- START DOTENV FIX ---
-// We must load dotenv *before* any other imports that rely on environment variables
-import path from 'path';
-import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
+import path from "path";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
 
-// Find the root directory (one level up from 'app') and load the .env file
+// Load .env from the project root (one level up from /app)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const envPath = path.resolve(__dirname, '../.env');
-dotenv.config({ path: envPath });
-
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 // --- END DOTENV FIX ---
 
-// Now, all other imports will have access to process.env
+// Core & middleware
 import express from "express";
 import cors from "cors";
+import compression from "compression";
+import helmet from "helmet";
+import crypto from "crypto";
+import { performance } from "perf_hooks";
+
+// App modules
 import { childLogger } from "./utils/logger.js";
 import { generateToken } from "./auth/jwt.js";
 import { requireAuth } from "./auth/middleware.js";
-// English Comments: Import both routing functions
 import { routeAndAnswer, routeAndAnswerStream } from "./routers/routerAgent.js";
-// dotenv.config(); // This is now at the top
+
+// Optional: model registry route (remove if not used)
+import { listAvailableModels } from "./services/modelRegistry.js";
 
 const logger = childLogger("server");
 const app = express();
-// ... (rest of the file is identical to your "most up-to-date" version) ...
-// ... (קטע זה נחתך לשם קיצור. שאר הקובץ זהה לגרסה המעודכנת שלך) ...
-const PORT = process.env.PORT || 8000;
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
-const REGION = process.env.AWS_REGION || "us-east-1";
 
-// Models configuration (unchanged)
+/* -------------------- Utilities -------------------- */
+/**
+ * Normalize env strings to remove stray quotes and zero-width spaces.
+ * This prevents errors like "Invalid model identifier" caused by copy/paste.
+ */
+function normalize(str) {
+  return String(str ?? "")
+    .replace(/\u200B/g, "")             // zero-width chars
+    .replace(/^['"\s]+|['"\s]+$/g, "")  // surrounding quotes/spaces
+    .trim();
+}
+
+/**
+ * Clean a *full* paragraph/answer before returning in non-streaming responses.
+ * Keep newlines and single spaces. Do not crush content structure.
+ */
+function cleanBlock(s) {
+  return String(s)
+    .replace(/\[object Object\]/g, "")
+    // collapse only tabs into a single space, keep spaces/newlines as-is:
+    .replace(/\t+/g, " ")
+    // remove control characters except \n and \r:
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+}
+
+/**
+ * Clean *stream deltas* without touching spaces/newlines.
+ * Never trim—models often send leading spaces as part of the token.
+ */
+function cleanDelta(s) {
+  return String(s)
+    .replace(/\[object Object\]/g, "")
+    // strip zero-width chars; keep all visible whitespace
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    // remove control characters except \n and \r:
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+}
+
+/* -------------------- 1) Config & validation -------------------- */
+const PORT = Number(process.env.PORT) || 8000;
+const FRONTEND_ORIGIN = normalize(process.env.FRONTEND_ORIGIN || "http://localhost:3000");
+const REGION =
+  normalize(process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1");
+
+// Centralized models config; adjust model IDs to your Bedrock access
 const MODELS = {
-  classify: process.env.BEDROCK_MODEL_CLASSIFY || "anthropic.claude-3-5-sonnet-20241022-v2:0",
-  general:  process.env.BEDROCK_MODEL_GENERAL  || "anthropic.claude-3-5-sonnet-20241022-v2:0",
-  code:     process.env.BEDROCK_MODEL_CODE     || "mistral.mistral-large-2407",
-  finance:  process.env.BEDROCK_MODEL_FINANCE  || "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  classify: normalize(process.env.BEDROCK_MODEL_CLASSIFY || "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+  general:  normalize(process.env.BEDROCK_MODEL_GENERAL  || "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+  code:     normalize(process.env.BEDROCK_MODEL_CODE     || "mistral.mistral-large-2407"),
+  finance:  normalize(process.env.BEDROCK_MODEL_FINANCE  || "anthropic.claude-3-5-sonnet-20241022-v2:0"),
 };
 
-// --- MIDDLEWARE --- (unchanged)
+// Quick boot log (avoid printing secrets)
+logger.info("Boot config", { PORT, REGION, FRONTEND_ORIGIN, MODELS });
+
+/* -------------------- 2) Security & performance middlewares -------------------- */
+app.set("trust proxy", true); // set true if behind proxy/load balancer
+
+// Secure headers
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }, // allow images/fonts from other origins if needed
+}));
+
+// Compression: DO NOT compress SSE (it breaks streaming on some proxies)
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (req.path === "/api/stream") return false;
+    return compression.filter(req, res);
+  }
+}));
+
+// Body parsers with safe limits
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// CORS (expose minimal headers needed for SSE/Fetch)
 app.use(cors({
   origin: FRONTEND_ORIGIN,
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  exposedHeaders: ["Content-Type", "Cache-Control", "X-Request-Id"],
   credentials: false,
 }));
-app.options("*", cors({
-  origin: FRONTEND_ORIGIN,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
-  credentials: false,
-}));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// --- ROUTES ---
+// Lightweight request id & timing logs
+app.use((req, res, next) => {
+  const rid = crypto.randomUUID();
+  const start = performance.now();
+  res.setHeader("X-Request-Id", rid);
+  // @ts-ignore - augmenting Express req object
+  req.id = rid;
 
-// Health check (unchanged)
-app.get("/health", (_req, res) => {
-  logger.info("Health check OK");
-  res.json({ ok: true });
+  res.on("finish", () => {
+    const ms = Math.round(performance.now() - start);
+    logger.info("HTTP", { id: rid, method: req.method, path: req.originalUrl, status: res.statusCode, ms });
+  });
+  next();
 });
 
-// Demo login (unchanged)
+/* -------------------- 3) Routes -------------------- */
+// Health & readiness
+app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/livez", (_req, res) => res.status(200).end("OK"));
+app.get("/readyz", (_req, res) => res.status(200).end("READY"));
+app.get("/version", (_req, res) => res.json({ version: process.env.APP_VERSION || "dev" }));
+
+// Optional: list Bedrock models (remove if not implemented)
+app.get("/api/models", requireAuth(), async (_req, res, next) => {
+  try {
+    const list = await listAvailableModels(REGION);
+    res.json(list);
+  } catch (e) {
+    // You can return 501 instead if the registry is not implemented:
+    // return res.status(501).json({ error: "Not implemented" });
+    next(e);
+  }
+});
+
+// Demo login -> issues a JWT (do not use as-is in production)
 app.post("/api/login", (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: "email required" });
@@ -70,119 +156,140 @@ app.post("/api/login", (req, res) => {
   res.json({ token });
 });
 
-// JSON chat (unchanged) - uses the regular routeAndAnswer
-app.post("/api/chat", requireAuth(), async (req, res) => {
-  const { prompt } = req.body || {};
-  if (!prompt) return res.status(400).json({ error: "Missing prompt" });
-
+// Non-streaming chat: returns { intent, answer }
+app.post("/api/chat", requireAuth(), async (req, res, next) => {
   try {
-    logger.info("Received prompt:", prompt);
-    const result = await routeAndAnswer({ text: prompt, models: MODELS, region: REGION });
-    res.json(result);
+    const { prompt } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "Missing prompt" });
+
+    const result = await routeAndAnswer({
+      text: String(prompt),
+      models: MODELS,
+      region: REGION
+    });
+
+    res.json({
+      intent: result.intent,                 // "code" | "finance" | "general"
+
+      answer: cleanBlock(result.answer)
+    });
   } catch (e) {
-    logger.error("Agent error", e);
-    res.status(500).json({ error: "Agent error" });
+    next(e);
   }
 });
 
-// --- /api/stream - rewritten for true streaming ---
-app.get("/api/stream", requireAuth(), async (req, res) => {
-  const prompt = (req.query.q || "").toString();
-  logger.info("Stream request received", { prompt });
+// Streaming chat via Server-Sent Events (SSE)
+app.get("/api/stream", requireAuth(), async (req, res, _next) => {
+  const prompt = String(req.query.q || "");
   if (!prompt) return res.status(400).end();
 
-  // SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  // SSE headers: avoid buffering and proxy transformations
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
-  
-  // Flush the headers immediately to the browser
-  res.flushHeaders();
+  res.setHeader("X-Accel-Buffering", "no"); // for Nginx (disables buffering)
+  res.write(`retry: 5000\n\n`); // client auto-reconnect after 5s
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
 
-  // Keep-alive ping every 15s
-  const keepAlive = setInterval(() => {
-    res.write(":\n\n");
-  }, 15000);
+  // Abort downstream work when client disconnects
+  const ac = new AbortController();
+  const { signal } = ac;
 
-  // Clean up resources when the client disconnects
-  req.on("close", () => {
+  // Keep-alive comment every 15s (valid SSE "comment" frame)
+  const keepAlive = setInterval(() => res.write(`: keep-alive\n\n`), 15000);
+
+  const cleanup = () => {
     clearInterval(keepAlive);
-    logger.info("Client disconnected from stream.");
-    res.end(); // Ensure the connection is closed
-  });
+    ac.abort();
+    try { res.end(); } catch {}
+  };
+
+  req.on("close", cleanup);
+  req.on("aborted", cleanup);
 
   try {
-    // --- Core of the change ---
-    // English Comments: Call the new generator function
-    const stream = routeAndAnswerStream({ text: prompt, models: MODELS, region: REGION });
+    // routeAndAnswerStream MUST be an async generator yielding:
+    // { type: "intent"|"delta"|"error"|"done", ... }
+    const stream = routeAndAnswerStream({
+      text: prompt,
+      models: MODELS,
+      region: REGION,
+      signal
+    });
 
-    // English Comments: Loop over the stream - each `chunk` comes directly from Bedrock
-    for await (const chunk of stream) {
-      // English Comments: The chunk is already formatted as `data: {...}\n\n` by the router
-      // We parse it to handle specific content types, like JSON deltas
-      
-      // Handle different chunk types (intent vs. delta)
-      if (chunk.startsWith("data:")) {
-        const rawJson = chunk.substring(5).trim();
-        try {
-          const parsed = JSON.parse(rawJson);
-          if (parsed.delta) {
-            // It's a text delta
-            res.write(`data: ${JSON.stringify({ delta: parsed.delta })}\n\n`);
-          } else if (parsed.intent) {
-            // It's the intent object
-            res.write(`data: ${JSON.stringify({ intent: parsed.intent })}\n\n`);
-          } else if (parsed.error) {
-             // It's an error object
-            res.write(`data: ${JSON.stringify({ error: parsed.error })}\n\n`);
-          } else if (parsed.done) {
-             // It's a done object
-            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-          } else {
-            // Fallback for unexpected JSON structures
-             res.write(chunk);
-          }
-        } catch (e) {
-          // Not valid JSON, might be a text chunk from a model that doesn't wrap in JSON
-          // Or it's a raw chunk that needs to be wrapped
-           res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
+    let sentDone = false;
+
+    for await (const msg of stream) {
+      if (!msg || typeof msg !== "object") continue;
+
+     if (msg.type === "intent") {
+  res.write(`data: ${JSON.stringify({
+    intent: msg.intent || "general",
+    agentName: msg.agentName || null
+  })}\n\n`);
+
+} else if (msg.type === "delta") {
+        // IMPORTANT: do not trim or collapse spaces/newlines in deltas
+        const text = cleanDelta(String(msg.delta ?? ""));
+        // Only skip empty strings; preserve all whitespace content
+        if (text !== "") {
+          res.write(`data: ${JSON.stringify({ delta: text })}\n\n`);
         }
-      } else if (chunk.startsWith(":")) {
-         // It's a keep-alive, write it directly
-         res.write(chunk);
-      } else {
-         // Fallback for any other text, wrap it as a delta
-         res.write(`data: ${JSON.stringify({ delta: chunk })}\n\n`);
+      } else if (msg.type === "error") {
+        res.write(`data: ${JSON.stringify({ error: String(msg.error || "stream error") })}\n\n`);
+      } else if (msg.type === "done") {
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        sentDone = true;
       }
     }
-    // --- End of change ---
 
-    // English Comments: Send a 'done' message that the client (ChatBox.js) understands
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    
-  } catch (e) {
-    logger.error("Stream route error", e);
-    // English Comments: Send an error message in SSE format
-    if (!res.headersSent) {
-      res.status(500);
+    // Ensure a final done frame
+    if (!sentDone) {
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
     }
-    res.write(`data: ${JSON.stringify({ error: "Agent error" })}\n\n`);
+  } catch (err) {
+    logger.error("Stream route error", { /* @ts-ignore */ id: req.id, err: err?.message });
+    // Headers already sent in SSE; emit an error frame instead of changing status
+    try { res.write(`data: ${JSON.stringify({ error: "Agent error" })}\n\n`); } catch {}
   } finally {
-    // English Comments: Clean up resources and close the connection
-    clearInterval(keepAlive);
-    res.end();
+    cleanup();
   }
 });
 
-// --- START SERVER --- (unchanged)
+/* -------------------- 4) Central error handler -------------------- */
+app.use((err, req, res, _next) => {
+  const status = Number(err?.status || 500);
+  const msg = String(err?.message || "Internal error");
+  // @ts-ignore
+  logger.error("Unhandled error", { id: req.id, status, msg });
+  if (res.headersSent) return; // if SSE already flowing
+  res.status(status).json({ error: msg });
+});
+
+/* -------------------- 5) Start & graceful shutdown -------------------- */
 const server = app.listen(PORT, () => {
-  console.log(`API listening on http://localhost:${PORT}`);
+  logger.info(`API listening on http://localhost:${PORT}`);
 });
 
 server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
+  if (err && err.code === "EADDRINUSE") {
     console.error(`Port ${PORT} is already in use. Try: PORT=${Number(PORT) + 1} npm run start`);
   } else {
     console.error("Server error:", err);
   }
 });
+
+function shutdown(signal) {
+  logger.warn(`Received ${signal}, shutting down...`);
+  server.close((err) => {
+    if (err) {
+      logger.error("Error on close", err);
+      process.exit(1);
+    }
+    logger.info("HTTP server closed. Bye.");
+    process.exit(0);
+  });
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
