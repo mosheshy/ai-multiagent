@@ -56,8 +56,8 @@ export async function* genericAgentStream({ text, models, region, signal }) {
     region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
   const modelId = process.env.BEDROCK_MODEL_GENERAL || models?.general;
 
-  const agentId = process.env.BEDROCK_GENERIC_AGENT_ID;
-  const aliasId = process.env.BEDROCK_GENERIC_AGENT_ALIAS_ID;
+  const agentId = process.env.BEDROCK_GENERAL_AGENT_ID;
+  const aliasId = process.env.BEDROCK_GENERAL_AGENT_ALIAS_ID;
 
   // 1) Try Agent streaming
   if (agentId && aliasId) {

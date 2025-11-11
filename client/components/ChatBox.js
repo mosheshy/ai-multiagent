@@ -1,253 +1,347 @@
+// components/ChatBox.js
 import { useEffect, useRef, useState } from "react";
+import {
+  AppBar,
+  Toolbar,
+  Typography,
+  IconButton,
+  Box,
+  Stack,
+  Paper,
+  TextField,
+  Button,
+  Tooltip,
+  CircularProgress,
+  Chip,
+} from "@mui/material";
+import SendIcon from "@mui/icons-material/Send";
+import StopCircleIcon from "@mui/icons-material/StopCircle";
 
+/**
+ * ChatBox (Material UI)
+ * - Professional layout with AppBar, bubbles, and sticky input.
+ * - SSE streaming with whitespace preserved (no trim on deltas).
+ * - Cancel in-flight stream safely.
+ */
 export default function ChatBox() {
-  // --- Component State ---
-
-  // Stores the text currently being typed by the user
+  // --- State ---
   const [input, setInput] = useState("");
-  // Stores the list of all messages (from user, assistant, or system)
-  const [messages, setMessages] = useState([]); // E.g., [{role: 'user', text: 'Hello!'}]
-  // Tracks if a message is currently being streamed from the server
+  const [messages, setMessages] = useState([]); // [{role: 'user'|'assistant'|'system', text: string}]
   const [sending, setSending] = useState(false);
-
+  const [agent, setAgent] = useState(null); 
   // --- Refs ---
-
-  // Ref to the message list DOM element for scrolling
   const listRef = useRef(null);
-  // Ref to the AbortController, allowing us to cancel an in-progress fetch request
-  const streamRef = useRef(null);
+  const streamRef = useRef(null); // AbortController for the current stream
 
-  // --- Helper Functions ---
-
-  /**
-   * Smoothly scrolls the message list container to the bottom.
-   */
+  // --- Helpers ---
   function scrollToBottom() {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+    if (!listRef.current) return;
+    listRef.current.scrollTo({
+      top: listRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }
 
-  /**
-   * Appends a new message object to the `messages` state array.
-   * @param {object} msg - The message object (e.g., {role: 'user', text: 'Hi'})
-   */
   function pushMessage(msg) {
-    setMessages(prev => [...prev, msg]);
+    setMessages((prev) => [...prev, msg]);
   }
 
-  /**
-   * Updates the 'text' content of the *last* message in the array.
-   * This is used for streaming, to append new deltas to the assistant's response.
-   * @param {string} text - The new, complete text for the last message.
-   */
   function updateLastAssistant(text) {
-    setMessages(prev => {
-      // Safety check: do nothing if messages array is empty
+    setMessages((prev) => {
       if (!prev.length) return prev;
-
-      // Create a new array to avoid mutating state directly
       const out = [...prev];
-
-      // Update the last element
       out[out.length - 1] = { role: "assistant", text };
       return out;
     });
   }
 
-  /**
-   * Handles the form submission to send a new message.
-   * This function initiates a streaming SSE request to the server.
-   */
+  // --- Core: send + stream via SSE (Fetch streaming) ---
   async function send(e) {
-    // Prevent default form submission which reloads the page
     e?.preventDefault?.();
 
-    // 1. Get the auth token from localStorage
     const token = localStorage.getItem("token");
     if (!token) {
-      // This is a user-facing error, so an alert is acceptable here.
       alert("Please login first");
       return;
     }
 
-    // 2. Get the user's prompt and validate it
     const prompt = input.trim();
-    // Do not send if:
-    // - The prompt is empty (just whitespace)
-    // - A request is already in progress (`sending` is true)
     if (!prompt || sending) return;
 
-    // 3. Abort any previous stream that might still be running
+    // Abort any previous stream
     streamRef.current?.abort();
     streamRef.current = null;
 
-    // 4. Update UI:
-    pushMessage({ role: "user", text: prompt });  // Show the user's message
-    pushMessage({ role: "assistant", text: "" }); // Add an empty placeholder for the bot's reply
-    setInput("");       // Clear the input field
-    setSending(true);   // Set loading state (disables the 'Send' button)
-    scrollToBottom();   // Scroll to the new messages
+    // UI bootstrap
+    pushMessage({ role: "user", text: prompt });
+    pushMessage({ role: "assistant", text: "" }); // placeholder for streamed answer
+    setInput("");
+    setSending(true);
+    scrollToBottom();
 
-    // 5. Prepare the API request
     const API = process.env.NEXT_PUBLIC_API || "http://localhost:8000";
     const controller = new AbortController();
-    streamRef.current = controller; // Store the controller in the ref so 'cancel' can use it
+    streamRef.current = controller;
 
     try {
-      // 6. Make the fetch request to the streaming endpoint
-      // Note: We send the token in *both* the query param and the Authorization header
-      // for maximum compatibility with different server/proxy setups.
-      const res = await fetch(`${API}/api/stream?q=${encodeURIComponent(prompt)}&token=${encodeURIComponent(token)}`, {
-        method: "GET",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Accept": "text/event-stream", // Specify we want a Server-Sent Events stream
-        },
-        signal: controller.signal, // Pass the AbortController's signal
-      });
+      const res = await fetch(
+        `${API}/api/stream?q=${encodeURIComponent(prompt)}&token=${encodeURIComponent(
+          token
+        )}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "text/event-stream",
+          },
+          signal: controller.signal,
+        }
+      );
 
-      // 7. Handle bad responses (e.g., 401 Unauthorized, 500 Server Error)
       if (!res.ok || !res.body) {
-        const errText = await res.text().catch(() => res.statusText);
-        cleanup(`HTTP ${res.status}: ${errText}`); // Use cleanup to show error and reset state
+        const txt = await res.text().catch(() => res.statusText);
+        cleanup(`HTTP ${res.status}: ${txt}`);
         return;
       }
 
-      // 8. Process the streaming response (SSE)
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = ""; // Holds incomplete chunks of data
-      let acc = "";    // Holds the accumulated text for the *current* response
-
-      // Loop forever until the stream is done
+      let buffer = ""; // raw SSE text buffer
+      let acc = ""; // accumulated assistant text
+      let intentShown = false;
+      // Read the stream forever until done/aborted
       for (;;) {
         const { value, done } = await reader.read();
-        if (done) break; // The stream has ended
+        if (done) break;
 
-        // Add the new chunk of data to our buffer
         buffer += decoder.decode(value, { stream: true });
 
-        // An SSE frame ends with two newlines ("\n\n")
-        let sepIndex;
-        while ((sepIndex = buffer.indexOf("\n\n")) >= 0) {
-          // Get the complete frame
-          const frame = buffer.slice(0, sepIndex).trim();
-          // Keep the rest of the buffer for the next iteration
-          buffer = buffer.slice(sepIndex + 2);
+        // Process complete SSE frames delimited by \n\n
+        for (let sep = buffer.indexOf("\n\n"); sep >= 0; sep = buffer.indexOf("\n\n")) {
+          // DO NOT trim the whole frame (would crush whitespace).
+          const frame = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
 
-          // Ignore SSE comments (lines starting with ":")
-          if (!frame || frame.startsWith(":")) continue;
+          // Ignore comments (lines starting with ":")
+          const isComment = frame.startsWith(":");
+          if (isComment || frame.length === 0) continue;
 
-          // Process "data:" lines
-          if (frame.startsWith("data:")) {
-            const jsonStr = frame.replace(/^data:\s?/, "");
-            try {
-              const data = JSON.parse(jsonStr);
+          // Each frame may have multiple "data:" lines; join them.
+          // We only care about lines beginning with "data:".
+          const dataLines = frame
+            .split("\n")
+            .filter((ln) => ln.startsWith("data:"))
+            .map((ln) => ln.replace(/^data:\s?/, "")); // remove only the "data:" prefix
 
-              // A 'delta' is a new piece of text
-              if (data.delta) {
-                acc += data.delta;           // Add new text to the accumulator
-                updateLastAssistant(acc);  // Update the UI with the full accumulated text
-                scrollToBottom();            // Keep scrolling to the bottom
-              }
-              // Handle server-side errors sent over the stream
-              if (data.error) {
-                cleanup(data.error); // Show error and stop
-                return;
-              }
-              // The server signals the end of the stream
-              if (data.done) {
-                cleanup(); // Finalize the stream
-                return;
-              }
-            } catch {
-              // Ignore frames that aren't valid JSON
+          if (!dataLines.length) continue;
+
+          // Join lines to form a single JSON string; no trimming of content itself.
+          const jsonStr = dataLines.join("\n");
+
+          try {
+            const payload = JSON.parse(jsonStr);
+            if (payload.intent) {
+    pushMessage({
+      role: "system",
+      text: `→ ${payload.agentName || payload.intent} handling your request...`,
+    });
+  }
+
+            if (payload.delta !== undefined) {
+              // Preserve whitespace; do not trim.
+              const delta = String(payload.delta)
+                // strip zero-width/control chars but keep spaces/newlines
+                .replace(/[\u200B-\u200D\uFEFF]/g, "")
+                .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+              acc += delta;
+              updateLastAssistant(acc);
+              scrollToBottom();
             }
+            if (payload.error) {
+              cleanup(String(payload.error));
+              return;
+            }
+            if (payload.done) {
+              cleanup();
+              return;
+            }
+          } catch {
+            // Ignore non-JSON frames
           }
         }
       }
-      // If the stream ends without a `data: {"done": true}` message,
-      // we still clean up gracefully.
-      cleanup();
 
+      // Graceful end if server didn’t send {done:true}
+      cleanup();
     } catch (err) {
-      // Handle network errors or if the user aborted the request
-      if (err.name === 'AbortError') {
-        // This is expected if the user hits 'Cancel', do nothing special.
-        // The 'cancel' function itself will handle the UI update.
-      } else {
-        // A real network error occurred
+      if (err?.name !== "AbortError") {
         cleanup("Connection error. Try again.");
       }
     }
   }
 
-  /**
-   * Manually cancels the in-flight streaming request.
-   * Triggered by the "Cancel" button.
-   */
   function cancel() {
-    if (streamRef.current) {
-      streamRef.current.abort(); // Abort the fetch request
-      streamRef.current = null;
-      setSending(false); // Reset loading state
-      pushMessage({ role: "system", text: "Stopped." }); // Notify user
-    }
-  }
-
-  /**
-   * A special useEffect hook that runs only when the component unmounts.
-   * This ensures that if the user navigates away, any in-progress
-   * stream is automatically cancelled to prevent memory leaks.
-   */
-  useEffect(() => {
-    // The function returned from useEffect is the "cleanup" function
-    return () => {
-      streamRef.current?.abort();
-    };
-  }, []); // The empty dependency array [] means this runs once on mount/unmount
-
-  /**
-   * Shared cleanup function to reset state after a stream finishes or errors.
-   * @param {string} [note] - An optional system message to display (e.g., an error).
-   */
-  function cleanup(note) {
-    streamRef.current?.abort(); // Ensure stream is aborted
+    streamRef.current?.abort();
     streamRef.current = null;
-    setSending(false); // Reset loading state
-    if (note) {
-      pushMessage({ role: "system", text: note }); // Push an error/system message
-    }
+    setSending(false);
+    pushMessage({ role: "system", text: "Stopped." });
   }
 
-  // --- Render JSX ---
+  function cleanup(note) {
+    streamRef.current?.abort();
+    streamRef.current = null;
+    setSending(false);
+    if (note) pushMessage({ role: "system", text: note });
+  }
+
+  // Abort in-flight stream on unmount
+  useEffect(() => () => streamRef.current?.abort(), []);
+
+  // Auto-scroll when messages change
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // --- Render ---
   return (
-    <div>
-      {/* Message List Area */}
-      <div
+    <Box
+      sx={{
+        height: "100vh",
+        display: "grid",
+        gridTemplateRows: "auto 1fr auto",
+        bgcolor: (t) => t.palette.mode === "dark" ? "background.default" : "#f5f6fa",
+      }}
+    >
+      {/* Top Bar */}
+      <AppBar position="sticky" elevation={1} color="default">
+        <Toolbar>
+          <Typography variant="h6" sx={{ fontWeight: 700 }}>
+            AI Assistant
+          </Typography>
+        </Toolbar>
+        <Toolbar sx={{ display: "flex", gap: 2 }}>
+          <Typography variant="h6" sx={{ fontWeight: 700, flex: 1 }}>
+            AI Assistant
+          </Typography>
+          {agent && (
+           <Chip
+              label={agent}
+              size="small"
+             color="primary"
+              variant="outlined"
+              sx={{ fontWeight: 600 }}
+           />
+          )}
+        </Toolbar>
+        
+      </AppBar>
+
+      {/* Messages area */}
+      <Box
         ref={listRef}
-        style={{ border: "1px solid #ddd", padding: 16, minHeight: 320, maxHeight: 480, overflow: "auto" }}
+        sx={{
+          overflowY: "auto",
+          p: 2,
+          display: "flex",
+          flexDirection: "column",
+          gap: 1.5,
+        }}
       >
-        {messages.map((m, i) => (
-          <div key={i} style={{ margin: "8px 0" }}>
-            <b>{m.role}:</b> <span>{m.text}</span>
-          </div>
-        ))}
-      </div>
+        {messages.map((m, i) => {
+          const isUser = m.role === "user";
+          const isAssistant = m.role === "assistant";
+          const isSystem = m.role === "system";
 
-      {/* Input Form */}
-      <form onSubmit={send} style={{ display: "flex", gap: 8, marginTop: 12 }}>
-        <input
+          return (
+            <Stack
+              key={i}
+              direction="row"
+              justifyContent={isUser ? "flex-end" : "flex-start"}
+            >
+              <Paper
+                elevation={0}
+                sx={{
+                  px: 1.75,
+                  py: 1.25,
+                  maxWidth: "75ch",
+                  borderRadius: 3,
+                  borderTopRightRadius: isUser ? 4 : 12,
+                  borderTopLeftRadius: isUser ? 12 : 4,
+                  bgcolor: isUser ? "primary.main" : isSystem ? "warning.light" : "grey.200",
+                  color: isUser ? "primary.contrastText" : "text.primary",
+                  border: isSystem ? "1px solid" : "none",
+                  borderColor: isSystem ? "warning.main" : "transparent",
+                  whiteSpace: "pre-wrap", // preserve spaces/newlines from streaming
+                  wordBreak: "break-word",
+                }}
+              >
+                {isAssistant && !m.text && sending ? (
+                  // Typing indicator while assistant text is empty and sending
+                  <Stack direction="row" alignItems="center" spacing={1}>
+                    <CircularProgress size={16} />
+                    <Typography variant="body2">typing…</Typography>
+                  </Stack>
+                ) : (
+                  <Typography variant="body1">{m.text}</Typography>
+                )}
+              </Paper>
+            </Stack>
+          );
+        })}
+      </Box>
+
+      {/* Input area */}
+      <Box
+        component="form"
+        onSubmit={send}
+        sx={{
+          p: 1.5,
+          display: "grid",
+          gridTemplateColumns: "1fr auto auto",
+          gap: 1,
+          borderTop: (t) => `1px solid ${t.palette.divider}`,
+          bgcolor: "background.paper",
+        }}
+      >
+        <TextField
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={(e) => setInput(e.target.value)}
           placeholder="Type a message…"
-          style={{ flex: 1, padding: 8 }}
+          size="medium"
+          fullWidth
+          disabled={sending}
         />
-        {/* The Send button is disabled if a request is 'sending' OR if the input is empty */}
-        <button type="submit" disabled={sending || !input.trim()}>Send</button>
 
-        {/* The Cancel button is only enabled while a request is 'sending' */}
-        <button type="button" onClick={cancel} disabled={!sending}>Cancel</button>
-      </form>
-    </div>
+        <Tooltip title="Send">
+          <span>
+            <Button
+              type="submit"
+              variant="contained"
+              startIcon={<SendIcon />}
+              disabled={sending || !input.trim()}
+              sx={{ px: 2.5 }}
+            >
+              Send
+            </Button>
+          </span>
+        </Tooltip>
+
+        <Tooltip title="Cancel">
+          <span>
+            <Button
+              type="button"
+              variant="outlined"
+              color="error"
+              startIcon={<StopCircleIcon />}
+              onClick={cancel}
+              disabled={!sending}
+              sx={{ px: 2.5 }}
+            >
+              Cancel
+            </Button>
+          </span>
+        </Tooltip>
+      </Box>
+    </Box>
   );
 }

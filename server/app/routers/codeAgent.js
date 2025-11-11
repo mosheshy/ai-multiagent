@@ -88,6 +88,8 @@ export async function* codingAgentStream({ text, models, region, signal }) {
     }
   }
 
+
+  
   // 2) Fallback: model streaming
   if (!modelId) {
     throw new Error("codingAgentStream: No modelId resolved (set BEDROCK_MODEL_CODE or provide models.code).");
